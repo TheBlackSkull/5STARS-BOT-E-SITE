@@ -1,0 +1,1225 @@
+const {
+  AuditLogEvent,
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField
+} = require("discord.js");
+const path = require("node:path");
+const { config } = require("./config");
+const { acquireProcessLock } = require("./processLock");
+const { RoleStorage } = require("./storage");
+const { createWelcomeAttachment } = require("./welcomeImage");
+const { TicketSystem } = require("./ticketSystem");
+const { startDashboard } = require("../Sito/dashboard");
+
+const botLock = acquireProcessLock(path.resolve(__dirname, "..", "Dati", "bot.lock"), "5stars-bot");
+if (!botLock.acquired) {
+  console.error(`[startup] Bot gia in esecuzione con pid=${botLock.pid}. Avvio annullato.`);
+  process.exit(0);
+}
+
+const storage = new RoleStorage(config.roleStoragePath, config.guildId);
+const WELCOME_DEDUP_WINDOW_MS = 2 * 60 * 1000;
+const ROLE_AUDIT_WINDOW_MS = 15 * 1000;
+const MEMBER_COUNTER_DEBOUNCE_MS = 15 * 1000;
+const recentWelcomeSends = new Map();
+const COMMAND_OPTION_TYPES = {
+  string: 3,
+  channel: 7,
+  role: 8,
+  user: 6
+};
+const WELCOME_REQUIRED_CHANNEL_PERMISSIONS = [
+  { flag: PermissionsBitField.Flags.ViewChannel, name: "View Channel" },
+  { flag: PermissionsBitField.Flags.SendMessages, name: "Send Messages" },
+  { flag: PermissionsBitField.Flags.AttachFiles, name: "Attach Files" },
+  { flag: PermissionsBitField.Flags.ReadMessageHistory, name: "Read Message History" }
+];
+const COMMUNICATION_COLOR_PRESETS = {
+  info: 0x3498db,
+  avviso: 0xf1c40f,
+  importante: 0xe67e22,
+  successo: 0x2ecc71,
+  errore: 0xe74c3c,
+  evento: 0x9b59b6,
+  neutro: 0xb8c0cc
+};
+
+function resolveGuildId(guildOrId) {
+  if (!guildOrId) return null;
+  if (typeof guildOrId === "string") return guildOrId;
+  return guildOrId.id || guildOrId.guild?.id || null;
+}
+
+function getGuildSettings(guildOrId) {
+  return config.getGuildConfig(resolveGuildId(guildOrId));
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers
+  ],
+  partials: [Partials.GuildMember]
+});
+
+let ticketSystem;
+let dashboard;
+let slashCommands = [];
+const memberCounterTimers = new Map();
+const lastMemberCounterNames = new Map();
+
+function canManageRole(member, roleId) {
+  const guildMe = member.guild.members.me;
+  const role = member.guild.roles.cache.get(roleId);
+
+  if (!role) return false;
+  if (role.managed) return false;
+  if (role.id === member.guild.id) return false;
+  if (!guildMe) return false;
+
+  return role.position < guildMe.roles.highest.position;
+}
+
+function getRestorableRoleIds(member, roleIds) {
+  return roleIds.filter((roleId) => {
+    if (member.roles.cache.has(roleId)) return false;
+
+    return canManageRole(member, roleId);
+  });
+}
+
+async function addRoles(member, roleIds, reason) {
+  const cleanRoleIds = getRestorableRoleIds(member, roleIds);
+
+  if (cleanRoleIds.length === 0) {
+    return member;
+  }
+
+  return member.roles.add(cleanRoleIds, reason);
+}
+
+async function removeRole(member, roleId, reason) {
+  if (!member.roles.cache.has(roleId)) {
+    return member;
+  }
+
+  if (!canManageRole(member, roleId)) {
+    return member;
+  }
+
+  return member.roles.remove(roleId, reason);
+}
+
+function wasWelcomeRecentlySent(memberId) {
+  const expiresAt = recentWelcomeSends.get(memberId);
+  if (!expiresAt) return false;
+
+  if (expiresAt > Date.now()) {
+    return true;
+  }
+
+  recentWelcomeSends.delete(memberId);
+  return false;
+}
+
+function markWelcomeSent(memberId) {
+  const expiresAt = Date.now() + WELCOME_DEDUP_WINDOW_MS;
+  recentWelcomeSends.set(memberId, expiresAt);
+
+  const timeout = setTimeout(() => {
+    if (recentWelcomeSends.get(memberId) === expiresAt) {
+      recentWelcomeSends.delete(memberId);
+    }
+  }, WELCOME_DEDUP_WINDOW_MS);
+
+  if (typeof timeout.unref === "function") {
+    timeout.unref();
+  }
+}
+
+async function hasRecentWelcomeMessage(channel, memberId) {
+  if (!channel.messages?.fetch) {
+    return false;
+  }
+
+  try {
+    const botId = channel.client.user?.id;
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const now = Date.now();
+
+    return messages.some((message) => {
+      if (botId && message.author?.id !== botId) return false;
+      if (now - message.createdTimestamp > WELCOME_DEDUP_WINDOW_MS) return false;
+      const hasWelcomeFile = message.attachments.some((attachment) => attachment.name === "welcome-5stars.png");
+      return hasWelcomeFile && message.content?.includes(memberId);
+    });
+  } catch (error) {
+    console.warn(`[welcome] Impossibile controllare duplicati recenti: ${error.message}`);
+    return false;
+  }
+}
+
+async function getWelcomeChannel(guild, guildConfig = getGuildSettings(guild)) {
+  if (!guildConfig.welcomeChannelId) {
+    console.log(`[welcome] WELCOME_CHANNEL_ID non configurato per guild ${guild.id}, immagine non inviata.`);
+    return null;
+  }
+
+  const channel = await guild.channels.fetch(guildConfig.welcomeChannelId).catch((error) => {
+    console.warn(`[welcome] Canale welcome non leggibile (${guildConfig.welcomeChannelId}) in guild ${guild.id}: ${error.message}`);
+    return null;
+  });
+
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[welcome] Canale welcome non trovato o non testuale.");
+    return null;
+  }
+
+  return channel;
+}
+
+function getMissingWelcomePermissions(channel, botMember) {
+  const permissions = channel.permissionsFor(botMember);
+  if (!permissions) {
+    return WELCOME_REQUIRED_CHANNEL_PERMISSIONS.map((permission) => permission.name);
+  }
+
+  return WELCOME_REQUIRED_CHANNEL_PERMISSIONS
+    .filter((permission) => !permissions.has(permission.flag))
+    .map((permission) => permission.name);
+}
+
+async function validateWelcomeSetup(guild, botMember = null, guildConfig = getGuildSettings(guild)) {
+  const channel = await getWelcomeChannel(guild, guildConfig);
+  if (!channel) return null;
+
+  const member = botMember || guild.members.me || await guild.members.fetchMe().catch(() => null);
+  if (!member) {
+    console.warn("[welcome] Impossibile verificare i permessi del bot nel canale welcome.");
+    return channel;
+  }
+
+  const missingPermissions = getMissingWelcomePermissions(channel, member);
+  if (missingPermissions.length > 0) {
+    console.warn(`[welcome] Permessi mancanti in #${channel.name}: ${missingPermissions.join(", ")}.`);
+  } else {
+    console.log(`[welcome] Config OK: #${channel.name} (${channel.id}).`);
+  }
+
+  return channel;
+}
+
+async function sendWelcome(member, options = {}) {
+  const guildConfig = getGuildSettings(member.guild);
+  const {
+    force = false,
+    mentionUser = true,
+    reason = "join"
+  } = options;
+
+  const channel = await getWelcomeChannel(member.guild, guildConfig);
+
+  if (!channel) {
+    return false;
+  }
+
+  const botMember = member.guild.members.me || await member.guild.members.fetchMe().catch(() => null);
+  if (botMember) {
+    const missingPermissions = getMissingWelcomePermissions(channel, botMember);
+    if (missingPermissions.length > 0) {
+      console.warn(`[welcome] Invio bloccato per permessi mancanti in #${channel.name}: ${missingPermissions.join(", ")}.`);
+      return false;
+    }
+  }
+
+  if (!force && wasWelcomeRecentlySent(member.id)) {
+    console.log(`[welcome] Duplicato evitato per ${member.user.tag}.`);
+    return false;
+  }
+
+  if (!force && await hasRecentWelcomeMessage(channel, member.id)) {
+    console.log(`[welcome] Messaggio recente gia presente per ${member.user.tag}.`);
+    return false;
+  }
+
+  markWelcomeSent(member.id);
+  console.log(`[welcome] Invio immagine per ${member.user.tag} (${member.id}) in #${channel.name}. Motivo: ${reason}.`);
+
+  const attachment = await createWelcomeAttachment(member, guildConfig.welcomeBackgroundPath, guildConfig.welcomeImage);
+  const message = await channel.send({
+    content: mentionUser ? `${member}` : `Test welcome per ${member.user.tag}`,
+    allowedMentions: mentionUser ? undefined : { parse: [] },
+    files: [attachment]
+  });
+
+  console.log(`[welcome] Messaggio inviato per ${member.user.tag}: ${message.url}`);
+  return message;
+}
+
+function formatRoleList(guild, roleIds) {
+  if (roleIds.length === 0) {
+    return "Nessun ruolo.";
+  }
+
+  const visibleRoles = roleIds.slice(0, 12).map((roleId) => {
+    const role = guild.roles.cache.get(roleId);
+    return role ? `<@&${role.id}>` : `\`${roleId}\``;
+  });
+
+  if (roleIds.length > visibleRoles.length) {
+    visibleRoles.push(`+${roleIds.length - visibleRoles.length} altri`);
+  }
+
+  return visibleRoles.join(", ");
+}
+
+function getRoleDiff(oldMember, newMember) {
+  const addedRoleIds = newMember.roles.cache
+    .filter((role) => role.id !== newMember.guild.id && !oldMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+
+  const removedRoleIds = oldMember.roles.cache
+    .filter((role) => role.id !== newMember.guild.id && !newMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+
+  return { addedRoleIds, removedRoleIds };
+}
+
+function getAuditChangeRoleIds(entry) {
+  const roleIds = [];
+
+  for (const change of entry.changes || []) {
+    if (change.key !== "$add" && change.key !== "$remove") continue;
+
+    const values = [
+      ...(Array.isArray(change.new) ? change.new : []),
+      ...(Array.isArray(change.old) ? change.old : [])
+    ];
+
+    for (const value of values) {
+      if (value?.id) roleIds.push(value.id);
+    }
+  }
+
+  return roleIds;
+}
+
+async function getRoleAuditExecutor(member, changedRoleIds) {
+  const botMember = member.guild.members.me;
+  if (!botMember?.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    return null;
+  }
+
+  const auditLogs = await member.guild.fetchAuditLogs({
+    type: AuditLogEvent.MemberRoleUpdate,
+    limit: 6
+  }).catch((error) => {
+    console.warn(`[roles-log] Audit log non leggibile: ${error.message}`);
+    return null;
+  });
+
+  if (!auditLogs) return null;
+
+  const now = Date.now();
+  const changedRoleSet = new Set(changedRoleIds);
+
+  const entry = auditLogs.entries.find((auditEntry) => {
+    const targetId = auditEntry.target?.id || auditEntry.targetId;
+    if (targetId !== member.id) return false;
+    if (Math.abs(now - auditEntry.createdTimestamp) > ROLE_AUDIT_WINDOW_MS) return false;
+
+    const auditRoleIds = getAuditChangeRoleIds(auditEntry);
+    return auditRoleIds.length === 0 || auditRoleIds.some((roleId) => changedRoleSet.has(roleId));
+  });
+
+  return entry?.executor || null;
+}
+
+async function sendRoleChangeLog(member, roleDiff) {
+  const guildConfig = getGuildSettings(member.guild);
+  if (!guildConfig.roleLogChannelId) return;
+
+  const { addedRoleIds, removedRoleIds } = roleDiff;
+  if (addedRoleIds.length === 0 && removedRoleIds.length === 0) return;
+
+  const channel = await member.guild.channels.fetch(guildConfig.roleLogChannelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[roles-log] Canale log ruoli non trovato o non testuale.");
+    return;
+  }
+
+  const changedRoleIds = [...new Set([...addedRoleIds, ...removedRoleIds])];
+  const executor = await getRoleAuditExecutor(member, changedRoleIds);
+  const color = addedRoleIds.length > 0 && removedRoleIds.length > 0
+    ? 0xffc107
+    : addedRoleIds.length > 0
+      ? 0x19c37d
+      : 0xff4d4f;
+
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle("Cambio ruoli")
+    .setThumbnail(member.user.displayAvatarURL({ extension: "png", size: 256 }))
+    .addFields(
+      {
+        name: "Utente",
+        value: `${member.user.tag}\n${member}\n\`${member.id}\``,
+        inline: true
+      },
+      {
+        name: "Eseguito da",
+        value: executor ? `${executor.tag}\n<@${executor.id}>\n\`${executor.id}\`` : "Sconosciuto / sistema",
+        inline: true
+      },
+      {
+        name: "Ruoli aggiunti",
+        value: formatRoleList(member.guild, addedRoleIds),
+        inline: false
+      },
+      {
+        name: "Ruoli rimossi",
+        value: formatRoleList(member.guild, removedRoleIds),
+        inline: false
+      }
+    )
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+}
+
+async function sendMemberLog(member, type, roleIds = []) {
+  const guildConfig = getGuildSettings(member.guild);
+  if (!guildConfig.logChannelId) {
+    return;
+  }
+
+  const channel = await member.guild.channels.fetch(guildConfig.logChannelId).catch(() => null);
+
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[logs] Canale log non trovato o non testuale.");
+    return;
+  }
+
+  const isJoin = type === "join";
+  const embed = new EmbedBuilder()
+    .setColor(isJoin ? 0x19c37d : 0xff4d4f)
+    .setTitle(isJoin ? "Entrata membro" : "Uscita membro")
+    .setThumbnail(member.user.displayAvatarURL({ extension: "png", size: 256 }))
+    .addFields(
+      {
+        name: "Utente",
+        value: `${member.user.tag}\n\`${member.id}\``,
+        inline: true
+      },
+      {
+        name: isJoin ? "Ruoli assegnati" : "Ruoli salvati",
+        value: formatRoleList(member.guild, roleIds),
+        inline: false
+      }
+    )
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+}
+
+function formatCompactMemberCount(count) {
+  if (!Number.isFinite(count)) return "0";
+  if (count < 1000) return String(count);
+
+  const value = count / 1000;
+  const decimals = value >= 10 ? 1 : 2;
+  return `${value.toFixed(decimals).replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")}K`;
+}
+
+function buildMemberCounterName(count) {
+  return `Total Members: ${formatCompactMemberCount(count)}`;
+}
+
+async function updateMemberCounter(guild, reason = "Aggiornamento counter membri") {
+  const guildConfig = getGuildSettings(guild);
+  if (!guildConfig.memberCounterChannelId) return;
+
+  const freshGuild = await guild.fetch().catch(() => guild);
+  const memberCount = freshGuild.memberCount ?? guild.memberCount ?? guild.members.cache.size;
+  const counterName = buildMemberCounterName(memberCount);
+
+  if (lastMemberCounterNames.get(guild.id) === counterName) {
+    return;
+  }
+
+  const channel = await guild.channels.fetch(guildConfig.memberCounterChannelId).catch((error) => {
+    console.warn(`[member-counter] Canale counter non leggibile: ${error.message}`);
+    return null;
+  });
+
+  if (!channel) return;
+  if (channel.name === counterName) {
+    lastMemberCounterNames.set(guild.id, counterName);
+    return;
+  }
+
+  if (typeof channel.setName !== "function") {
+    console.warn("[member-counter] Il canale counter non supporta setName.");
+    return;
+  }
+
+  await channel.setName(counterName, reason);
+  lastMemberCounterNames.set(guild.id, counterName);
+  console.log(`[member-counter] Aggiornato: ${counterName}`);
+}
+
+function scheduleMemberCounterUpdate(guild, reason, immediate = false) {
+  const guildConfig = getGuildSettings(guild);
+  if (!guildConfig.memberCounterChannelId) return;
+
+  const existingTimer = memberCounterTimers.get(guild.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    memberCounterTimers.delete(guild.id);
+  }
+
+  const delay = immediate ? 0 : MEMBER_COUNTER_DEBOUNCE_MS;
+  const timer = setTimeout(() => {
+    memberCounterTimers.delete(guild.id);
+    updateMemberCounter(guild, reason).catch((error) => {
+      console.error("[member-counter] Errore aggiornamento:", error);
+    });
+  }, delay);
+
+  memberCounterTimers.set(guild.id, timer);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+}
+
+function canSendCommunication(interaction, guildConfig = getGuildSettings(interaction.guild)) {
+  if (!interaction.member) return false;
+
+  if (interaction.member.permissions?.has(PermissionsBitField.Flags.Administrator)) {
+    return true;
+  }
+
+  if (interaction.member.permissions?.has(PermissionsBitField.Flags.ManageMessages)) {
+    return true;
+  }
+
+  return guildConfig.staffRoleIds.some((roleId) => interaction.member.roles?.cache?.has(roleId));
+}
+
+function canUseOwnerCommand(interaction, guildConfig = getGuildSettings(interaction.guild)) {
+  const allowedIds = new Set([
+    ...config.ownerUserIds,
+    ...(guildConfig.ownerUserIds || [])
+  ].filter(Boolean));
+
+  return allowedIds.has(interaction.user.id);
+}
+
+function parseHexColor(input) {
+  if (!input) return null;
+
+  const normalized = input.trim().replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(normalized)) {
+    return null;
+  }
+
+  return Number.parseInt(normalized, 16);
+}
+
+function normalizeEmbedText(input) {
+  return input.trim().replace(/\\n/g, "\n");
+}
+
+function isValidHttpUrl(input) {
+  if (!input) return true;
+
+  try {
+    const url = new URL(input);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+async function handleCommunicationCommand(interaction) {
+  const guildConfig = getGuildSettings(interaction.guild);
+  if (!canSendCommunication(interaction, guildConfig)) {
+    return await interaction.reply({
+      content: "Solo staff o utenti con permesso Gestisci Messaggi possono inviare comunicazioni.",
+      ephemeral: true
+    });
+  }
+
+  const title = normalizeEmbedText(interaction.options.getString("titolo", true));
+  const description = normalizeEmbedText(interaction.options.getString("testo", true));
+  const targetChannel = interaction.options.getChannel("canale") || interaction.channel;
+  const style = interaction.options.getString("stile") || "info";
+  const customColor = interaction.options.getString("colore");
+  const imageUrl = interaction.options.getString("immagine");
+  const thumbnailUrl = interaction.options.getString("thumbnail");
+  const footer = interaction.options.getString("footer");
+  const pingRole = interaction.options.getRole("ping_ruolo");
+
+  if (!targetChannel || !targetChannel.isTextBased()) {
+    return await interaction.reply({
+      content: "Seleziona un canale testuale valido.",
+      ephemeral: true
+    });
+  }
+
+  if (targetChannel.guild?.id !== interaction.guild?.id) {
+    return await interaction.reply({
+      content: "La comunicazione puo essere inviata solo nel server in cui usi il comando.",
+      ephemeral: true
+    });
+  }
+
+  if (!title) {
+    return await interaction.reply({
+      content: "Il titolo della comunicazione non puo essere vuoto.",
+      ephemeral: true
+    });
+  }
+
+  if (!description) {
+    return await interaction.reply({
+      content: "Il testo della comunicazione non puo essere vuoto.",
+      ephemeral: true
+    });
+  }
+
+  const color = customColor
+    ? parseHexColor(customColor)
+    : COMMUNICATION_COLOR_PRESETS[style] || COMMUNICATION_COLOR_PRESETS.info;
+
+  if (color === null) {
+    return await interaction.reply({
+      content: "Colore non valido. Usa un formato HEX come `#d4af37`.",
+      ephemeral: true
+    });
+  }
+
+  if (!isValidHttpUrl(imageUrl)) {
+    return await interaction.reply({
+      content: "URL immagine non valido. Usa un link http o https.",
+      ephemeral: true
+    });
+  }
+
+  if (!isValidHttpUrl(thumbnailUrl)) {
+    return await interaction.reply({
+      content: "URL thumbnail non valido. Usa un link http o https.",
+      ephemeral: true
+    });
+  }
+
+  const botMember = await interaction.guild.members.fetchMe();
+  const channelPermissions = targetChannel.permissionsFor(botMember);
+  const canSendToChannel = channelPermissions?.has(PermissionsBitField.Flags.SendMessages)
+    || channelPermissions?.has(PermissionsBitField.Flags.SendMessagesInThreads);
+
+  if (!canSendToChannel || !channelPermissions?.has(PermissionsBitField.Flags.EmbedLinks)) {
+    return await interaction.reply({
+      content: `Non ho i permessi per inviare embed in ${targetChannel}.`,
+      ephemeral: true
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(description)
+    .setTimestamp();
+
+  const guildIcon = interaction.guild.iconURL({ extension: "png", size: 128 });
+  if (guildIcon) {
+    embed.setAuthor({ name: "5STARS Comunicazioni", iconURL: guildIcon });
+  } else {
+    embed.setAuthor({ name: "5STARS Comunicazioni" });
+  }
+
+  const footerText = footer ? normalizeEmbedText(footer).slice(0, 2048) : "";
+  embed.setFooter({ text: footerText || "Comunicazione ufficiale" });
+
+  if (imageUrl) {
+    embed.setImage(imageUrl);
+  }
+
+  if (thumbnailUrl) {
+    embed.setThumbnail(thumbnailUrl);
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const message = await targetChannel.send({
+    content: pingRole ? `${pingRole}` : undefined,
+    embeds: [embed],
+    allowedMentions: pingRole ? { roles: [pingRole.id] } : { parse: [] }
+  });
+
+  await interaction.editReply(`Comunicazione pubblicata in ${targetChannel}: ${message.url}`);
+}
+
+async function handlePermissionsCommand(interaction) {
+  const guildConfig = getGuildSettings(interaction.guild);
+  if (!canUseOwnerCommand(interaction, guildConfig)) {
+    return await interaction.reply({
+      content: "Non sei autorizzato a usare questo comando.",
+      ephemeral: true
+    });
+  }
+
+  const action = interaction.options.getString("azione", true);
+  const user = interaction.options.getUser("utente", true);
+  const role = interaction.options.getRole("ruolo", true);
+  const reasonInput = interaction.options.getString("motivo");
+  const reason = reasonInput
+    ? `Comando /permessi di ${interaction.user.tag}: ${reasonInput}`.slice(0, 512)
+    : `Comando /permessi di ${interaction.user.tag}`.slice(0, 512);
+
+  await interaction.deferReply({ ephemeral: true });
+
+  if (!["assegna", "rimuovi"].includes(action)) {
+    return await interaction.editReply("Azione non valida.");
+  }
+
+  const targetMember = await interaction.guild.members.fetch(user.id).catch(() => null);
+  if (!targetMember) {
+    return await interaction.editReply("Utente non trovato in questo server.");
+  }
+
+  const botMember = await interaction.guild.members.fetchMe();
+  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    return await interaction.editReply("Non ho il permesso `Gestisci ruoli`.");
+  }
+
+  if (!role || role.id === interaction.guild.id || role.managed) {
+    return await interaction.editReply("Questo ruolo non puo essere gestito dal bot.");
+  }
+
+  if (role.position >= botMember.roles.highest.position) {
+    return await interaction.editReply(`Non posso gestire ${role}: deve stare sotto il ruolo piu alto del bot.`);
+  }
+
+  if (action === "assegna") {
+    if (targetMember.roles.cache.has(role.id)) {
+      return await interaction.editReply(`${targetMember} ha gia ${role}.`);
+    }
+
+    await targetMember.roles.add(role, reason);
+    return await interaction.editReply(`Ruolo ${role} assegnato a ${targetMember}.`);
+  }
+
+  if (!targetMember.roles.cache.has(role.id)) {
+    return await interaction.editReply(`${targetMember} non ha ${role}.`);
+  }
+
+  await targetMember.roles.remove(role, reason);
+  return await interaction.editReply(`Ruolo ${role} rimosso da ${targetMember}.`);
+}
+
+async function handleTestWelcomeCommand(interaction) {
+  const guildConfig = getGuildSettings(interaction.guild);
+  if (!canSendCommunication(interaction, guildConfig)) {
+    return await interaction.reply({
+      content: "Solo staff o utenti con permesso Gestisci Messaggi possono testare il welcome.",
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const selectedUser = interaction.options.getUser("utente");
+  const targetUser = selectedUser || interaction.user;
+  const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+
+  if (!targetMember) {
+    return await interaction.editReply("Utente non trovato nel server.");
+  }
+
+  const message = await sendWelcome(targetMember, {
+    force: true,
+    mentionUser: false,
+    reason: `test richiesto da ${interaction.user.tag}`
+  });
+
+  if (!message) {
+    return await interaction.editReply("Test welcome non inviato. Controlla i log del bot per config, canale o permessi.");
+  }
+
+  return await interaction.editReply(`Test welcome inviato in ${message.channel}: ${message.url}`);
+}
+
+async function syncCitizenLinkedRole(member, reason, guildConfig = getGuildSettings(member.guild)) {
+  if (!guildConfig.roles.cittadino || !guildConfig.roles.whitelisted) {
+    return member;
+  }
+
+  if (!member.roles.cache.has(guildConfig.roles.cittadino)) {
+    return member;
+  }
+
+  if (member.roles.cache.has(guildConfig.roles.whitelisted)) {
+    return member;
+  }
+
+  return addRoles(member, [guildConfig.roles.whitelisted], reason);
+}
+
+async function syncWhitelistedRemovesWaiting(member, reason, guildConfig = getGuildSettings(member.guild)) {
+  if (!guildConfig.roles.whitelisted || !guildConfig.roles.attesaWhitelist) {
+    return member;
+  }
+
+  if (!member.roles.cache.has(guildConfig.roles.whitelisted)) {
+    return member;
+  }
+
+  return removeRole(member, guildConfig.roles.attesaWhitelist, reason);
+}
+
+async function setupGuildRuntime(readyClient, guild, commands) {
+  const guildConfig = getGuildSettings(guild);
+
+  if (commands.length > 0) {
+    await readyClient.application.commands.set(commands, guild.id);
+    console.log(`[ready] Comandi slash registrati in ${guild.name} (${guild.id}).`);
+  }
+
+  await ticketSystem.initializeFromGuild(guild);
+
+  const botMember = await guild.members.fetchMe().catch(() => null);
+  if (!botMember) {
+    console.warn(`[ready] Impossibile leggere il membro bot in ${guild.name} (${guild.id}).`);
+    return;
+  }
+
+  const permissions = botMember.permissions;
+
+  if (!permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    console.warn(`[ready] ${guild.name}: il bot non ha il permesso Manage Roles.`);
+  }
+
+  if (!permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+    console.warn(`[ready] ${guild.name}: il bot non ha il permesso Manage Channels (necessario per ticket e counter membri).`);
+  }
+
+  if (guildConfig.roleLogChannelId && !permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    console.warn(`[ready] ${guild.name}: il bot non ha View Audit Log, i log ruoli non mostreranno l'esecutore.`);
+  }
+
+  await validateWelcomeSetup(guild, botMember, guildConfig);
+  scheduleMemberCounterUpdate(guild, "Avvio bot: sincronizzazione counter membri", true);
+}
+
+client.once(Events.ClientReady, async (readyClient) => {
+  console.log(`[ready] ${readyClient.user.tag} online.`);
+
+  // Inizializza sistema ticket
+  ticketSystem = new TicketSystem(client);
+  console.log(`[ready] Sistema ticket inizializzato`);
+
+  if (config.dashboard.enabled && !dashboard) {
+    dashboard = startDashboard({ client, config });
+  }
+
+  // Registra comandi slash
+  try {
+    const commands = [
+      {
+        name: "ticket",
+        description: "Crea un pannello ticket con bottoni (solo amministratori)"
+      },
+      {
+        name: "close",
+        description: "Chiudi il ticket corrente (solo nel canale ticket)"
+      },
+      {
+        name: "rename",
+        description: "Rinomina il ticket corrente (solo staff)",
+        options: [
+          {
+            name: "nome",
+            description: "Nuovo nome descrittivo del ticket, esempio supporto-donazione",
+            type: COMMAND_OPTION_TYPES.string,
+            required: true,
+            min_length: 1,
+            max_length: 80
+          }
+        ]
+      },
+      {
+        name: "add-ticket",
+        description: "Aggiunge un utente al ticket corrente (solo staff)",
+        options: [
+          {
+            name: "utente",
+            description: "Utente da aggiungere al ticket",
+            type: COMMAND_OPTION_TYPES.user,
+            required: true
+          }
+        ]
+      },
+      {
+        name: "setup-tickets",
+        description: "Crea un pannello ticket fisso (solo amministratori)"
+      },
+      {
+        name: "comunicazione",
+        description: "Invia una comunicazione formattata in embed",
+        options: [
+          {
+            name: "titolo",
+            description: "Titolo della comunicazione",
+            type: COMMAND_OPTION_TYPES.string,
+            required: true,
+            max_length: 256
+          },
+          {
+            name: "testo",
+            description: "Testo della comunicazione. Usa \\n per andare a capo.",
+            type: COMMAND_OPTION_TYPES.string,
+            required: true,
+            max_length: 4000
+          },
+          {
+            name: "canale",
+            description: "Canale dove pubblicare. Se vuoto usa il canale corrente.",
+            type: COMMAND_OPTION_TYPES.channel,
+            required: false,
+            channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement]
+          },
+          {
+            name: "stile",
+            description: "Stile colore dell'embed",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false,
+            choices: [
+              { name: "Info", value: "info" },
+              { name: "Avviso", value: "avviso" },
+              { name: "Importante", value: "importante" },
+              { name: "Successo", value: "successo" },
+              { name: "Errore", value: "errore" },
+              { name: "Evento", value: "evento" },
+              { name: "Neutro", value: "neutro" }
+            ]
+          },
+          {
+            name: "colore",
+            description: "Colore HEX personalizzato, esempio #d4af37",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false,
+            min_length: 4,
+            max_length: 7
+          },
+          {
+            name: "immagine",
+            description: "URL immagine grande da mostrare sotto il testo",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false
+          },
+          {
+            name: "thumbnail",
+            description: "URL immagine piccola da mostrare in alto a destra",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false
+          },
+          {
+            name: "footer",
+            description: "Testo footer opzionale",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false,
+            max_length: 2048
+          },
+          {
+            name: "ping_ruolo",
+            description: "Ruolo da menzionare sopra la comunicazione",
+            type: COMMAND_OPTION_TYPES.role,
+            required: false
+          }
+        ]
+      },
+      {
+        name: "test-welcome",
+        description: "Invia una card welcome di test nel canale configurato",
+        options: [
+          {
+            name: "utente",
+            description: "Utente da usare nella card di test. Se vuoto usa te.",
+            type: COMMAND_OPTION_TYPES.user,
+            required: false
+          }
+        ]
+      },
+      {
+        name: "permessi",
+        description: "Assegna o rimuove un ruolo a un utente (solo owner autorizzati)",
+        options: [
+          {
+            name: "azione",
+            description: "Operazione da eseguire",
+            type: COMMAND_OPTION_TYPES.string,
+            required: true,
+            choices: [
+              { name: "Assegna", value: "assegna" },
+              { name: "Rimuovi", value: "rimuovi" }
+            ]
+          },
+          {
+            name: "utente",
+            description: "Utente su cui intervenire",
+            type: COMMAND_OPTION_TYPES.user,
+            required: true
+          },
+          {
+            name: "ruolo",
+            description: "Ruolo da assegnare o rimuovere",
+            type: COMMAND_OPTION_TYPES.role,
+            required: true
+          },
+          {
+            name: "motivo",
+            description: "Motivo opzionale per audit log",
+            type: COMMAND_OPTION_TYPES.string,
+            required: false,
+            max_length: 300
+          }
+        ]
+      }
+    ];
+
+    slashCommands = commands;
+    const fetchedGuilds = await readyClient.guilds.fetch().catch(() => null);
+    const guildIds = new Set([
+      ...readyClient.guilds.cache.keys(),
+      ...(fetchedGuilds ? [...fetchedGuilds.keys()] : [])
+    ]);
+
+    for (const guildId of guildIds) {
+      const guild = await readyClient.guilds.fetch(guildId).catch((error) => {
+        console.warn(`[ready] Guild non leggibile (${guildId}): ${error.message}`);
+        return null;
+      });
+
+      if (!guild) continue;
+      try {
+        await setupGuildRuntime(readyClient, guild, commands);
+      } catch (error) {
+        console.error(`[ready] Errore setup guild ${guild.name} (${guild.id}):`, error);
+      }
+    }
+  } catch (error) {
+    console.error("[ready] Errore registrazione comandi:", error);
+  }
+});
+
+client.on(Events.GuildCreate, async (guild) => {
+  try {
+    await setupGuildRuntime(client, guild, slashCommands);
+  } catch (error) {
+    console.error(`[guild-create] Errore setup guild ${guild.id}:`, error);
+  }
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  const guildConfig = getGuildSettings(member.guild);
+
+  console.log(`[join] Evento GuildMemberAdd ricevuto per ${member.user.tag} (${member.id}).`);
+  scheduleMemberCounterUpdate(member.guild, "Membro entrato: aggiornamento counter membri");
+
+  try {
+    const storedRoleIds = await storage.get(member.guild.id, member.id);
+    const roleIdsToRestore = guildConfig.restoreRolesOnJoin ? storedRoleIds : [];
+    const defaultJoinRoles = Array.isArray(guildConfig.defaultJoinRoles) ? guildConfig.defaultJoinRoles : [];
+    const roleIdsToAdd = [...new Set([...roleIdsToRestore, ...defaultJoinRoles])];
+
+    let updatedMember = member;
+    try {
+      updatedMember = await addRoles(
+        member,
+        roleIdsToAdd,
+        guildConfig.restoreRolesOnJoin
+          ? "Join 5STARS: ripristino ruoli"
+          : "Join 5STARS: assegnazione ruoli di default"
+      );
+    } catch (error) {
+      console.error(`[join] Errore assegnazione ruoli per ${member.user.tag}:`, error);
+    }
+
+    const results = await Promise.allSettled([
+      sendWelcome(member),
+      sendMemberLog(updatedMember, "join", roleIdsToAdd)
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.error(`[join] Errore task post-join per ${member.user.tag}:`, result.reason);
+      }
+    }
+  } catch (error) {
+    console.error(`[join] Errore per ${member.user.tag}:`, error);
+  }
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  scheduleMemberCounterUpdate(member.guild, "Membro uscito: aggiornamento counter membri");
+
+  try {
+    const fullMember = member.partial
+      ? await member.guild.members.fetch(member.id).catch(() => member)
+      : member;
+
+    const roleIds = fullMember.roles.cache
+      .filter((role) => role.id !== member.guild.id && !role.managed)
+      .map((role) => role.id);
+
+    await storage.set(member.guild.id, member.id, roleIds);
+    await sendMemberLog(member, "leave", roleIds);
+    console.log(`[leave] Salvati ${roleIds.length} ruoli per ${member.user.tag}.`);
+  } catch (error) {
+    console.error(`[leave] Errore salvataggio ruoli per ${member.id}:`, error);
+  }
+});
+
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  const guildConfig = getGuildSettings(newMember.guild);
+
+  try {
+    const roleDiff = getRoleDiff(oldMember, newMember);
+    const roleLogTask = sendRoleChangeLog(newMember, roleDiff).catch((error) => {
+      console.error(`[roles-log] Errore log cambio ruoli per ${newMember.user.tag}:`, error);
+    });
+
+    const hadCitizen = guildConfig.roles.cittadino && oldMember.roles.cache.has(guildConfig.roles.cittadino);
+    const hasCitizen = guildConfig.roles.cittadino && newMember.roles.cache.has(guildConfig.roles.cittadino);
+
+    let updatedMember = newMember;
+
+    if (guildConfig.linkCitizenToWhitelisted && !hadCitizen && hasCitizen) {
+      updatedMember = await syncCitizenLinkedRole(
+        updatedMember,
+        "Ruolo collegato: cittadino assegna whitelisted",
+        guildConfig
+      );
+    }
+
+    if (guildConfig.removeWaitingOnWhitelisted) {
+      await syncWhitelistedRemovesWaiting(
+        updatedMember,
+        "Ruolo collegato: whitelisted rimuove attesa whitelist",
+        guildConfig
+      );
+    }
+
+    await roleLogTask;
+  } catch (error) {
+    console.error(`[roles] Errore ruolo collegato per ${newMember.user.tag}:`, error);
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+  // Gestisci i comandi slash
+  if (interaction.isChatInputCommand()) {
+    if (!interaction.guild) {
+      return await interaction.reply({
+        content: "Questo comando può essere usato solo nel server 5STARS.",
+        ephemeral: true
+      });
+    }
+
+    if (interaction.commandName === "ticket") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleTicketCommand(interaction);
+    } else if (interaction.commandName === "close") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleCloseCommand(interaction);
+    } else if (interaction.commandName === "rename") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleRenameCommand(interaction);
+    } else if (interaction.commandName === "add-ticket") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleAddUserCommand(interaction);
+    } else if (interaction.commandName === "setup-tickets") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      // Reindirizza al ticket command per il pannello setup
+      await ticketSystem.handleTicketCommand(interaction);
+    } else if (interaction.commandName === "comunicazione") {
+      await handleCommunicationCommand(interaction);
+    } else if (interaction.commandName === "test-welcome") {
+      await handleTestWelcomeCommand(interaction);
+    } else if (interaction.commandName === "permessi") {
+      await handlePermissionsCommand(interaction);
+    }
+  }
+  } catch (error) {
+    console.error("[interaction] Errore gestione comando:", error);
+
+    if (interaction.isRepliable()) {
+      const payload = {
+        content: "Errore durante l'esecuzione del comando. Riprova tra poco.",
+        ephemeral: true
+      };
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(payload).catch(() => null);
+      } else {
+        await interaction.reply(payload).catch(() => null);
+      }
+    }
+  }
+});
+
+client.on("error", (error) => {
+  console.error("[client] Errore Discord client:", error);
+});
+
+client.on("shardError", (error) => {
+  console.error("[client] Errore shard Discord:", error);
+});
+
+client.on("warn", (warning) => {
+  console.warn("[client] Warn Discord:", warning);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[process] Unhandled rejection:", reason);
+  setTimeout(() => process.exit(1), 100);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[process] Uncaught exception:", error);
+  setTimeout(() => process.exit(1), 100);
+});
+
+client.login(config.discordToken);

@@ -1,0 +1,657 @@
+const {
+  AuditLogEvent,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField
+} = require("discord.js");
+const path = require("node:path");
+const { config } = require("./config");
+const { acquireProcessLock } = require("./processLock");
+const { RoleStorage } = require("./storage");
+const { createWelcomeAttachment } = require("./welcomeImage");
+const { TicketSystem } = require("./ticketSystem");
+const { startDashboard } = require("../Sito/dashboard");
+
+const botLock = acquireProcessLock(path.resolve(__dirname, "..", "Dati", "bot.lock"), "5stars-bot");
+if (!botLock.acquired) {
+  console.error(`[startup] Bot gia in esecuzione con pid=${botLock.pid}. Avvio annullato.`);
+  process.exit(0);
+}
+
+const storage = new RoleStorage(config.roleStoragePath);
+const WELCOME_DEDUP_WINDOW_MS = 2 * 60 * 1000;
+const ROLE_AUDIT_WINDOW_MS = 15 * 1000;
+const MEMBER_COUNTER_DEBOUNCE_MS = 15 * 1000;
+const recentWelcomeSends = new Map();
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers
+  ],
+  partials: [Partials.GuildMember]
+});
+
+let ticketSystem;
+let dashboard;
+let memberCounterTimer = null;
+let lastMemberCounterName = null;
+
+function canManageRole(member, roleId) {
+  const guildMe = member.guild.members.me;
+  const role = member.guild.roles.cache.get(roleId);
+
+  if (!role) return false;
+  if (role.managed) return false;
+  if (role.id === member.guild.id) return false;
+  if (!guildMe) return false;
+
+  return role.position < guildMe.roles.highest.position;
+}
+
+function getRestorableRoleIds(member, roleIds) {
+  return roleIds.filter((roleId) => {
+    if (member.roles.cache.has(roleId)) return false;
+
+    return canManageRole(member, roleId);
+  });
+}
+
+async function addRoles(member, roleIds, reason) {
+  const cleanRoleIds = getRestorableRoleIds(member, roleIds);
+
+  if (cleanRoleIds.length === 0) {
+    return member;
+  }
+
+  return member.roles.add(cleanRoleIds, reason);
+}
+
+async function removeRole(member, roleId, reason) {
+  if (!member.roles.cache.has(roleId)) {
+    return member;
+  }
+
+  if (!canManageRole(member, roleId)) {
+    return member;
+  }
+
+  return member.roles.remove(roleId, reason);
+}
+
+function wasWelcomeRecentlySent(memberId) {
+  const expiresAt = recentWelcomeSends.get(memberId);
+  if (!expiresAt) return false;
+
+  if (expiresAt > Date.now()) {
+    return true;
+  }
+
+  recentWelcomeSends.delete(memberId);
+  return false;
+}
+
+function markWelcomeSent(memberId) {
+  const expiresAt = Date.now() + WELCOME_DEDUP_WINDOW_MS;
+  recentWelcomeSends.set(memberId, expiresAt);
+
+  const timeout = setTimeout(() => {
+    if (recentWelcomeSends.get(memberId) === expiresAt) {
+      recentWelcomeSends.delete(memberId);
+    }
+  }, WELCOME_DEDUP_WINDOW_MS);
+
+  if (typeof timeout.unref === "function") {
+    timeout.unref();
+  }
+}
+
+async function hasRecentWelcomeMessage(channel, memberId) {
+  if (!channel.messages?.fetch) {
+    return false;
+  }
+
+  try {
+    const botId = channel.client.user?.id;
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const now = Date.now();
+
+    return messages.some((message) => {
+      if (botId && message.author?.id !== botId) return false;
+      if (now - message.createdTimestamp > WELCOME_DEDUP_WINDOW_MS) return false;
+      const hasWelcomeFile = message.attachments.some((attachment) => attachment.name === "welcome-5stars.png");
+      return hasWelcomeFile && message.content?.includes(memberId);
+    });
+  } catch (error) {
+    console.warn(`[welcome] Impossibile controllare duplicati recenti: ${error.message}`);
+    return false;
+  }
+}
+
+async function sendWelcome(member) {
+  if (!config.welcomeChannelId) {
+    console.log("[welcome] WELCOME_CHANNEL_ID non configurato, immagine non inviata.");
+    return false;
+  }
+
+  const channel = await member.guild.channels.fetch(config.welcomeChannelId).catch(() => null);
+
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[welcome] Canale welcome non trovato o non testuale.");
+    return false;
+  }
+
+  if (wasWelcomeRecentlySent(member.id)) {
+    console.log(`[welcome] Duplicato evitato per ${member.user.tag}.`);
+    return false;
+  }
+
+  markWelcomeSent(member.id);
+
+  if (await hasRecentWelcomeMessage(channel, member.id)) {
+    console.log(`[welcome] Messaggio recente gia presente per ${member.user.tag}.`);
+    return false;
+  }
+
+  const attachment = await createWelcomeAttachment(member, config.welcomeBackgroundPath, config.welcomeImage);
+  await channel.send({
+    content: `${member}`,
+    files: [attachment]
+  });
+
+  return true;
+}
+
+function formatRoleList(guild, roleIds) {
+  if (roleIds.length === 0) {
+    return "Nessun ruolo.";
+  }
+
+  const visibleRoles = roleIds.slice(0, 12).map((roleId) => {
+    const role = guild.roles.cache.get(roleId);
+    return role ? `<@&${role.id}>` : `\`${roleId}\``;
+  });
+
+  if (roleIds.length > visibleRoles.length) {
+    visibleRoles.push(`+${roleIds.length - visibleRoles.length} altri`);
+  }
+
+  return visibleRoles.join(", ");
+}
+
+function getRoleDiff(oldMember, newMember) {
+  const addedRoleIds = newMember.roles.cache
+    .filter((role) => role.id !== newMember.guild.id && !oldMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+
+  const removedRoleIds = oldMember.roles.cache
+    .filter((role) => role.id !== newMember.guild.id && !newMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+
+  return { addedRoleIds, removedRoleIds };
+}
+
+function getAuditChangeRoleIds(entry) {
+  const roleIds = [];
+
+  for (const change of entry.changes || []) {
+    if (change.key !== "$add" && change.key !== "$remove") continue;
+
+    const values = [
+      ...(Array.isArray(change.new) ? change.new : []),
+      ...(Array.isArray(change.old) ? change.old : [])
+    ];
+
+    for (const value of values) {
+      if (value?.id) roleIds.push(value.id);
+    }
+  }
+
+  return roleIds;
+}
+
+async function getRoleAuditExecutor(member, changedRoleIds) {
+  const botMember = member.guild.members.me;
+  if (!botMember?.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    return null;
+  }
+
+  const auditLogs = await member.guild.fetchAuditLogs({
+    type: AuditLogEvent.MemberRoleUpdate,
+    limit: 6
+  }).catch((error) => {
+    console.warn(`[roles-log] Audit log non leggibile: ${error.message}`);
+    return null;
+  });
+
+  if (!auditLogs) return null;
+
+  const now = Date.now();
+  const changedRoleSet = new Set(changedRoleIds);
+
+  const entry = auditLogs.entries.find((auditEntry) => {
+    const targetId = auditEntry.target?.id || auditEntry.targetId;
+    if (targetId !== member.id) return false;
+    if (Math.abs(now - auditEntry.createdTimestamp) > ROLE_AUDIT_WINDOW_MS) return false;
+
+    const auditRoleIds = getAuditChangeRoleIds(auditEntry);
+    return auditRoleIds.length === 0 || auditRoleIds.some((roleId) => changedRoleSet.has(roleId));
+  });
+
+  return entry?.executor || null;
+}
+
+async function sendRoleChangeLog(member, roleDiff) {
+  if (!config.roleLogChannelId) return;
+
+  const { addedRoleIds, removedRoleIds } = roleDiff;
+  if (addedRoleIds.length === 0 && removedRoleIds.length === 0) return;
+
+  const channel = await member.guild.channels.fetch(config.roleLogChannelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[roles-log] Canale log ruoli non trovato o non testuale.");
+    return;
+  }
+
+  const changedRoleIds = [...new Set([...addedRoleIds, ...removedRoleIds])];
+  const executor = await getRoleAuditExecutor(member, changedRoleIds);
+  const color = addedRoleIds.length > 0 && removedRoleIds.length > 0
+    ? 0xffc107
+    : addedRoleIds.length > 0
+      ? 0x19c37d
+      : 0xff4d4f;
+
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle("Cambio ruoli")
+    .setThumbnail(member.user.displayAvatarURL({ extension: "png", size: 256 }))
+    .addFields(
+      {
+        name: "Utente",
+        value: `${member.user.tag}\n${member}\n\`${member.id}\``,
+        inline: true
+      },
+      {
+        name: "Eseguito da",
+        value: executor ? `${executor.tag}\n<@${executor.id}>\n\`${executor.id}\`` : "Sconosciuto / sistema",
+        inline: true
+      },
+      {
+        name: "Ruoli aggiunti",
+        value: formatRoleList(member.guild, addedRoleIds),
+        inline: false
+      },
+      {
+        name: "Ruoli rimossi",
+        value: formatRoleList(member.guild, removedRoleIds),
+        inline: false
+      }
+    )
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+}
+
+async function sendMemberLog(member, type, roleIds = []) {
+  if (!config.logChannelId) {
+    return;
+  }
+
+  const channel = await member.guild.channels.fetch(config.logChannelId).catch(() => null);
+
+  if (!channel || !channel.isTextBased()) {
+    console.warn("[logs] Canale log non trovato o non testuale.");
+    return;
+  }
+
+  const isJoin = type === "join";
+  const embed = new EmbedBuilder()
+    .setColor(isJoin ? 0x19c37d : 0xff4d4f)
+    .setTitle(isJoin ? "Entrata membro" : "Uscita membro")
+    .setThumbnail(member.user.displayAvatarURL({ extension: "png", size: 256 }))
+    .addFields(
+      {
+        name: "Utente",
+        value: `${member.user.tag}\n\`${member.id}\``,
+        inline: true
+      },
+      {
+        name: isJoin ? "Ruoli assegnati" : "Ruoli salvati",
+        value: formatRoleList(member.guild, roleIds),
+        inline: false
+      }
+    )
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+}
+
+function formatCompactMemberCount(count) {
+  if (!Number.isFinite(count)) return "0";
+  if (count < 1000) return String(count);
+
+  const value = count / 1000;
+  const decimals = value >= 10 ? 1 : 2;
+  return `${value.toFixed(decimals).replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")}K`;
+}
+
+function buildMemberCounterName(count) {
+  return `Total Members: ${formatCompactMemberCount(count)}`;
+}
+
+async function updateMemberCounter(guild, reason = "Aggiornamento counter membri") {
+  if (!config.memberCounterChannelId) return;
+
+  const freshGuild = await guild.fetch().catch(() => guild);
+  const memberCount = freshGuild.memberCount ?? guild.memberCount ?? guild.members.cache.size;
+  const counterName = buildMemberCounterName(memberCount);
+
+  if (lastMemberCounterName === counterName) {
+    return;
+  }
+
+  const channel = await guild.channels.fetch(config.memberCounterChannelId).catch((error) => {
+    console.warn(`[member-counter] Canale counter non leggibile: ${error.message}`);
+    return null;
+  });
+
+  if (!channel) return;
+  if (channel.name === counterName) {
+    lastMemberCounterName = counterName;
+    return;
+  }
+
+  if (typeof channel.setName !== "function") {
+    console.warn("[member-counter] Il canale counter non supporta setName.");
+    return;
+  }
+
+  await channel.setName(counterName, reason);
+  lastMemberCounterName = counterName;
+  console.log(`[member-counter] Aggiornato: ${counterName}`);
+}
+
+function scheduleMemberCounterUpdate(guild, reason, immediate = false) {
+  if (!config.memberCounterChannelId) return;
+
+  if (memberCounterTimer) {
+    clearTimeout(memberCounterTimer);
+    memberCounterTimer = null;
+  }
+
+  const delay = immediate ? 0 : MEMBER_COUNTER_DEBOUNCE_MS;
+  memberCounterTimer = setTimeout(() => {
+    memberCounterTimer = null;
+    updateMemberCounter(guild, reason).catch((error) => {
+      console.error("[member-counter] Errore aggiornamento:", error);
+    });
+  }, delay);
+
+  if (typeof memberCounterTimer.unref === "function") {
+    memberCounterTimer.unref();
+  }
+}
+
+async function syncCitizenLinkedRole(member, reason) {
+  if (!member.roles.cache.has(config.roles.cittadino)) {
+    return member;
+  }
+
+  if (member.roles.cache.has(config.roles.whitelisted)) {
+    return member;
+  }
+
+  return addRoles(member, [config.roles.whitelisted], reason);
+}
+
+async function syncWhitelistedRemovesWaiting(member, reason) {
+  if (!member.roles.cache.has(config.roles.whitelisted)) {
+    return member;
+  }
+
+  return removeRole(member, config.roles.attesaWhitelist, reason);
+}
+
+client.once(Events.ClientReady, async (readyClient) => {
+  console.log(`[ready] ${readyClient.user.tag} online.`);
+
+  // Inizializza sistema ticket
+  ticketSystem = new TicketSystem(client);
+  console.log(`[ready] Sistema ticket inizializzato`);
+
+  const guild = await readyClient.guilds.fetch(config.guildId).catch(() => null);
+  if (!guild) {
+    console.warn(`[ready] Server non trovato: ${config.guildId}`);
+    return;
+  }
+
+  await ticketSystem.initializeFromGuild(guild);
+
+  const botMember = await guild.members.fetchMe();
+  const permissions = botMember.permissions;
+
+  if (!permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    console.warn("[ready] Il bot non ha il permesso Manage Roles.");
+  }
+
+  if (!permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+    console.warn("[ready] Il bot non ha il permesso Manage Channels (necessario per ticket e counter membri).");
+  }
+
+  if (config.roleLogChannelId && !permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    console.warn("[ready] Il bot non ha il permesso View Audit Log: i log ruoli non mostreranno l'esecutore.");
+  }
+
+  if (config.dashboard.enabled && !dashboard) {
+    dashboard = startDashboard({ client, config });
+  }
+
+  scheduleMemberCounterUpdate(guild, "Avvio bot: sincronizzazione counter membri", true);
+
+  // Registra comandi slash
+  try {
+    const commands = [
+      {
+        name: "ticket",
+        description: "Crea un pannello ticket con bottoni (solo amministratori)"
+      },
+      {
+        name: "close",
+        description: "Chiudi il ticket corrente (solo nel canale ticket)"
+      },
+      {
+        name: "setup-tickets",
+        description: "Crea un pannello ticket fisso (solo amministratori)"
+      }
+    ];
+
+    await readyClient.application.commands.set(commands, config.guildId);
+    console.log(`[ready] Comandi slash registrati`);
+  } catch (error) {
+    console.error("[ready] Errore registrazione comandi:", error);
+  }
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (member.guild.id !== config.guildId) {
+    return;
+  }
+
+  scheduleMemberCounterUpdate(member.guild, "Membro entrato: aggiornamento counter membri");
+
+  try {
+    const storedRoleIds = await storage.get(member.id);
+    const roleIdsToRestore = config.restoreRolesOnJoin ? storedRoleIds : [];
+    const defaultJoinRoles = Array.isArray(config.defaultJoinRoles) ? config.defaultJoinRoles : [];
+    const roleIdsToAdd = [...new Set([...roleIdsToRestore, ...defaultJoinRoles])];
+
+    let updatedMember = member;
+    try {
+      updatedMember = await addRoles(
+        member,
+        roleIdsToAdd,
+        config.restoreRolesOnJoin
+          ? "Join 5STARS: ripristino ruoli"
+          : "Join 5STARS: assegnazione ruoli di default"
+      );
+    } catch (error) {
+      console.error(`[join] Errore assegnazione ruoli per ${member.user.tag}:`, error);
+    }
+
+    const results = await Promise.allSettled([
+      sendWelcome(member),
+      sendMemberLog(updatedMember, "join", roleIdsToAdd)
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.error(`[join] Errore task post-join per ${member.user.tag}:`, result.reason);
+      }
+    }
+  } catch (error) {
+    console.error(`[join] Errore per ${member.user.tag}:`, error);
+  }
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  if (member.guild.id !== config.guildId) {
+    return;
+  }
+
+  scheduleMemberCounterUpdate(member.guild, "Membro uscito: aggiornamento counter membri");
+
+  try {
+    const fullMember = member.partial
+      ? await member.guild.members.fetch(member.id).catch(() => member)
+      : member;
+
+    const roleIds = fullMember.roles.cache
+      .filter((role) => role.id !== member.guild.id && !role.managed)
+      .map((role) => role.id);
+
+    await storage.set(member.id, roleIds);
+    await sendMemberLog(member, "leave", roleIds);
+    console.log(`[leave] Salvati ${roleIds.length} ruoli per ${member.user.tag}.`);
+  } catch (error) {
+    console.error(`[leave] Errore salvataggio ruoli per ${member.id}:`, error);
+  }
+});
+
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  if (newMember.guild.id !== config.guildId) {
+    return;
+  }
+
+  try {
+    const roleDiff = getRoleDiff(oldMember, newMember);
+    const roleLogTask = sendRoleChangeLog(newMember, roleDiff).catch((error) => {
+      console.error(`[roles-log] Errore log cambio ruoli per ${newMember.user.tag}:`, error);
+    });
+
+    const hadCitizen = oldMember.roles.cache.has(config.roles.cittadino);
+    const hasCitizen = newMember.roles.cache.has(config.roles.cittadino);
+
+    let updatedMember = newMember;
+
+    if (config.linkCitizenToWhitelisted && !hadCitizen && hasCitizen) {
+      updatedMember = await syncCitizenLinkedRole(
+        updatedMember,
+        "Ruolo collegato: cittadino assegna whitelisted"
+      );
+    }
+
+    if (config.removeWaitingOnWhitelisted) {
+      await syncWhitelistedRemovesWaiting(
+        updatedMember,
+        "Ruolo collegato: whitelisted rimuove attesa whitelist"
+      );
+    }
+
+    await roleLogTask;
+  } catch (error) {
+    console.error(`[roles] Errore ruolo collegato per ${newMember.user.tag}:`, error);
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+  // Gestisci i comandi slash
+  if (interaction.isChatInputCommand()) {
+    if (interaction.guild?.id !== config.guildId) {
+      return await interaction.reply({
+        content: "Questo comando può essere usato solo nel server 5STARS.",
+        ephemeral: true
+      });
+    }
+
+    if (interaction.commandName === "ticket") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleTicketCommand(interaction);
+    } else if (interaction.commandName === "close") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      await ticketSystem.handleCloseCommand(interaction);
+    } else if (interaction.commandName === "setup-tickets") {
+      if (!ticketSystem) {
+        return await interaction.reply({
+          content: "Sistema ticket non ancora inizializzato.",
+          ephemeral: true
+        });
+      }
+      // Reindirizza al ticket command per il pannello setup
+      await ticketSystem.handleTicketCommand(interaction);
+    }
+  }
+  } catch (error) {
+    console.error("[interaction] Errore gestione comando:", error);
+
+    if (interaction.isRepliable()) {
+      const payload = {
+        content: "Errore durante l'esecuzione del comando. Riprova tra poco.",
+        ephemeral: true
+      };
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(payload).catch(() => null);
+      } else {
+        await interaction.reply(payload).catch(() => null);
+      }
+    }
+  }
+});
+
+client.on("error", (error) => {
+  console.error("[client] Errore Discord client:", error);
+});
+
+client.on("shardError", (error) => {
+  console.error("[client] Errore shard Discord:", error);
+});
+
+client.on("warn", (warning) => {
+  console.warn("[client] Warn Discord:", warning);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[process] Unhandled rejection:", reason);
+  setTimeout(() => process.exit(1), 100);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[process] Uncaught exception:", error);
+  setTimeout(() => process.exit(1), 100);
+});
+
+client.login(config.discordToken);
