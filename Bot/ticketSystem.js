@@ -774,13 +774,14 @@ class TicketSystem {
     }
 
     const addedUserIds = new Set(ticketData.addedUserIds || []);
-    if (addedUserIds.has(targetUser.id)) {
-      return await interaction.reply({
-        content: `${targetUser} ha gia accesso a questo ticket.`,
-        ephemeral: true
-      });
-    }
+    const hasOverwrite = interaction.channel.permissionOverwrites.cache.has(targetUser.id);
 
+    if (addedUserIds.has(targetUser.id) && hasOverwrite) {
+      return await interaction.reply({
+        content: `${targetUser} ha già accesso a questo ticket.`,
+        ephemeral: true
+      })
+    
     await interaction.deferReply({ ephemeral: true });
 
     try {
