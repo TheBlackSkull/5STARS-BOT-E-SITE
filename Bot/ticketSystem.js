@@ -781,6 +781,7 @@ class TicketSystem {
         content: `${targetUser} ha già accesso a questo ticket.`,
         ephemeral: true
       })
+    }
     
     await interaction.deferReply({ ephemeral: true });
 
