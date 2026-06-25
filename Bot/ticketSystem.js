@@ -369,9 +369,18 @@ class TicketSystem {
     const ticketData = this.resolveTicketData(newChannel);
     if (!ticketData) return;
 
+    // CONTROLLO E AGGIORNAMENTO DI CATEGORIA SE IL CANALE VIENE SPOSTATO
+    const newCategory = this.getCategoryFromParent(newChannel.parentId, guildConfig);
+    if (newCategory && ticketData.category !== newCategory) {
+      ticketData.category = newCategory;
+      this.activeTickets.set(newChannel.id, ticketData);
+      await this.updateTicketTopic(newChannel, ticketData); // Aggiorna anche i metadati nel topic
+      console.log(`[ticket] Canale ${newChannel.name} spostato nella categoria: ${newCategory}. Aggiorno permessi...`);
+    }
+
     await this.syncTicketPermissions(newChannel, ticketData, "Auto-sync permessi ticket");
   }
-
+  
   async initializeFromGuild(guild) {
     const guildConfig = this.getGuildConfig(guild);
     const channels = await guild.channels.fetch().catch((error) => {
