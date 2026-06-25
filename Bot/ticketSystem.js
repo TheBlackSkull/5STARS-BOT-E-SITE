@@ -329,6 +329,7 @@ class TicketSystem {
     } finally {
       setTimeout(() => this.syncingTicketChannels.delete(channel.id), 2000).unref?.();
     }
+  }
 
 ///////////////////////////////////////////////////////////////////////////////////////
   async updateTicketTopic(channel, ticketData) {
