@@ -292,10 +292,9 @@ class TicketSystem {
   async syncTicketCategoryBase(channel, categoryChannel, reason) {
     try {
       if (channel.parentId !== categoryChannel.id) {
-        await channel.setParent(categoryChannel.id, { lockPermissions: true, reason });
+        await channel.setParent(categoryChannel.id, { lockPermissions: false, reason });
         return true;
       }
-      await channel.lockPermissions();
       return true;
     } catch (error) {
       console.error("[ticket] Errore sync base permessi:", error);
@@ -309,7 +308,8 @@ class TicketSystem {
 
     const guildConfig = this.getGuildConfig(channel.guild);
     const categoryId = guildConfig.ticketCategories[ticketData.category] || channel.parentId;
-    const categoryChannel = await channel.guild.channels.fetch(categoryId).catch(() => null);
+    
+    const categoryChannel = await channel.guild.channels.fetch(categoryId, { force: true }).catch(() => null);
 
     if (!categoryChannel || categoryChannel.type !== ChannelType.GuildCategory) {
       return false;
@@ -323,10 +323,12 @@ class TicketSystem {
         reason
       );
       return true;
+    } catch (error) {
+      console.error("[ticket] Errore applicazione permessi overwrites:", error);
+      return false;
     } finally {
       setTimeout(() => this.syncingTicketChannels.delete(channel.id), 2000).unref?.();
     }
-  }
 
 ///////////////////////////////////////////////////////////////////////////////////////
   async updateTicketTopic(channel, ticketData) {
@@ -369,16 +371,16 @@ class TicketSystem {
     const ticketData = this.resolveTicketData(newChannel);
     if (!ticketData) return;
 
-    // CONTROLLO E AGGIORNAMENTO DI CATEGORIA SE IL CANALE VIENE SPOSTATO
-    const newCategory = this.getCategoryFromParent(newChannel.parentId, guildConfig);
-    if (newCategory && ticketData.category !== newCategory) {
-      ticketData.category = newCategory;
-      this.activeTickets.set(newChannel.id, ticketData);
-      await this.updateTicketTopic(newChannel, ticketData); // Aggiorna anche i metadati nel topic
-      console.log(`[ticket] Canale ${newChannel.name} spostato nella categoria: ${newCategory}. Aggiorno permessi...`);
+    if (oldChannel.parentId !== newChannel.parentId) {
+      const newCategory = this.getCategoryFromParent(newChannel.parentId, guildConfig);
+      if (newCategory && ticketData.category !== newCategory) {
+        ticketData.category = newCategory;
+        this.activeTickets.set(newChannel.id, ticketData);
+        console.log(`[ticket] Canale ${newChannel.name} spostato nella categoria: ${newCategory}. Aggiorno permessi...`);
+      }
+      
+      await this.syncTicketPermissions(newChannel, ticketData, "Auto-sync permessi ticket");
     }
-
-    await this.syncTicketPermissions(newChannel, ticketData, "Auto-sync permessi ticket");
   }
   
   async initializeFromGuild(guild) {
