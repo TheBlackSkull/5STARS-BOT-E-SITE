@@ -1083,6 +1083,10 @@ class TicketSystem {
         .setLabel("Gestione")
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
+        .setCustomId("ticket_attività")
+        .setLabel("Attività")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
         .setCustomId("ticket_developer")
         .setLabel("Developer")
         .setStyle(ButtonStyle.Primary),
