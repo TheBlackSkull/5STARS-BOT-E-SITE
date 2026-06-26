@@ -131,6 +131,7 @@ function cleanStringMap(value) {
 
 const DEFAULT_TICKET_LABELS = {
   gestione: { label: "Gestione", emoji: "🏢" },
+  attività: { label: "Attività", emoji: "📋" },
   developer: { label: "Developer", emoji: "💻" },
   azioni: { label: "Azioni", emoji: "⚡" },
   convalide: { label: "Convalide", emoji: "✅" },
