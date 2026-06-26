@@ -131,7 +131,7 @@ function cleanStringMap(value) {
 
 const DEFAULT_TICKET_LABELS = {
   gestione: { label: "Gestione", emoji: "🏢" },
-  attività: { label: "Attività", emoji: "📋" },
+  attivita: { label: "Attività", emoji: "📋" },
   developer: { label: "Developer", emoji: "💻" },
   azioni: { label: "Azioni", emoji: "⚡" },
   convalide: { label: "Convalide", emoji: "✅" },
@@ -233,7 +233,7 @@ const config = {
   },
   ticketCategories: {
     gestione: envOrFileString("TICKET_GESTIONE_ID", "ticketCategories.gestione", false, "1499812965581328461"),
-    developer: envOrFileString("TICKET_DEVELOPER_ID", "ticketCategories.developer", false, "1499812965581328455"),
+    attivita: envOrFileString("TICKET_ATTIVITA_ID", "ticketCategories.attivita", false, "1520105942044250152"),
     azioni: envOrFileString("TICKET_AZIONI_ID", "ticketCategories.azioni", false, "1499812965581328463"),
     convalide: envOrFileString("TICKET_CONVALIDA_ID", "ticketCategories.convalide", false, "1499812965938106450"),
     permadeath: envOrFileString("TICKET_PERMADEATH_ID", "ticketCategories.permadeath", false, "1499812965938106451"),
